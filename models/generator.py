@@ -17,7 +17,7 @@ class AIGGenerator(nn.Module):
                  node_in_dim: int = 2,
                  hidden_dim: int = 128,
                  z_dim: int = 128,
-                 device: torch.device = torch.device('cpu'),
+                 device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                  max_prev_candidates: int = 4096,
                  depth_perturb: int = 2):
         super().__init__()

@@ -56,9 +56,9 @@ def train(args):
     print(f"[INFO] Using max_nodes = {max_nodes}")
 
     data_list = collate_and_pad(data_list, max_nodes)
-    print(f"[DEBUG] Loaded dataset: {len(data_list)} samples")
+    #print(f"[DEBUG] Loaded dataset: {len(data_list)} samples")
 
-    loader = PyGDataLoader(data_list, batch_size=args.batch_size, shuffle=True, drop_last=False, num_workers=0)
+    loader = PyGDataLoader(data_list, batch_size=args.batch_size, shuffle=True, drop_last=False, num_workers=2)
     print(f"[DEBUG] Loader batches: {len(loader)}")
     for i, d in enumerate(data_list[:3]):
         print(f"[DEBUG] Sample {i}: x={d.x.shape}, edge_index={d.edge_index.shape}, edge_attr={d.edge_attr.shape}, node_depth={d.node_depth.shape}")
@@ -182,7 +182,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-nodes", type=int, default=None)
     parser.add_argument("--max-prev-candidates", type=int, default=4096)
     parser.add_argument("--lambda-cons", type=float, default=1e-3)
-    parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--save-every", type=int, default=6)
     parser.add_argument("--save-num", type=int, default=4)
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--log-every", type=int, default=1)
