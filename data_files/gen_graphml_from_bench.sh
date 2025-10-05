@@ -4,9 +4,9 @@
 # 依赖：提供的andAIG2Graphml.py脚本
 
 # 配置参数
-PYTHON_SCRIPT="andAIG2Graphml.py"  # Python转换脚本路径
-ROOT_DIR="openabcd/bench"                # 根目录
-GML_OUTPUT_DIR="openabcd/graphml"  # 输出目录
+PYTHON_SCRIPT="data_files/andAIG2Graphml.py"  # Python转换脚本路径
+ROOT_DIR="data_files/datasets/ISCAS89/bench"                # 根目录
+GML_OUTPUT_DIR="data_files/datasets/ISCAS89/graphml"  # 输出目录
 
 # 检查Python脚本是否存在
 if [ ! -f "$PYTHON_SCRIPT" ]; then

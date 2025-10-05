@@ -220,5 +220,5 @@ def main():
 if __name__ == '__main__':
     main()
 """
-python andAIG2Graphml.py --bench openabcd/bench/aes_secworks_orig.bench --gml openabcd/graphml/
+python andAIG2Graphml.py --bench ISCAS85/bench/aes_secworks_orig.bench --gml openabcd/graphml/
 """

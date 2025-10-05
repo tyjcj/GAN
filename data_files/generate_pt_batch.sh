@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # 定义输入bench文件夹和输出pt文件夹
-BENCH_DIR="openabcd/bench"
-OUTPUT_DIR="openabcd/graph"
+BENCH_DIR="datasets/openabcd/graphml"
+OUTPUT_DIR="datasets/openabcd/graph"
 
 # 创建输出文件夹（如果不存在）
 mkdir -p "$OUTPUT_DIR"

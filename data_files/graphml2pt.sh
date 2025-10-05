@@ -5,9 +5,9 @@
 # 命名规则：xxx.bench.graphml -> xxx.pt
 
 # 配置参数
-PYTHON_SCRIPT="generate_pt.py"       # Python转换脚本路径
-GRAPHML_DIR="openabcd/graphml"       # graphml文件所在目录
-OUTPUT_DIR="openabcd/graph"                # 输出pt文件的目录
+PYTHON_SCRIPT="data_files/generate_pt.py"       # Python转换脚本路径
+GRAPHML_DIR="data_files/datasets/ISCAS85/graphml"       # graphml文件所在目录
+OUTPUT_DIR="data_files/datasets/ISCAS85/graph"                # 输出pt文件的目录
 
 # 检查Python脚本是否存在
 if [ ! -f "$PYTHON_SCRIPT" ]; then

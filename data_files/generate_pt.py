@@ -28,7 +28,13 @@ def pygDataFromNetworkx(G):
     G = G.to_directed() if not nx.is_directed(G) else G
 
     # edge_index
-    edge_index = torch.tensor(list(G.edges)).t().contiguous()
+    # Some GraphMLs load as MultiDiGraph and G.edges may yield (u,v,key) triplets.
+    # Force 2-tuple (u,v) to ensure shape [2, E].
+    if isinstance(G, (nx.MultiDiGraph, nx.MultiGraph)):
+        edges_uv = list(G.edges(keys=False))  # returns (u, v)
+    else:
+        edges_uv = list(G.edges())
+    edge_index = torch.tensor(edges_uv).t().contiguous()
 
     # x = [node_type, num_inverted_predecessors]
     node_type = []
@@ -36,16 +42,16 @@ def pygDataFromNetworkx(G):
     for _, feat in G.nodes(data=True):
         node_type.append(int(feat.get("node_type", 2)))  # 默认 Internal=2
         num_inv_preds.append(int(feat.get("num_inverted_predecessors", 0)))
-    x = torch.tensor(list(zip(node_type, num_inv_preds)), dtype=torch.long)
+    x = torch.tensor(list(zip(node_type, num_inv_preds)), dtype=torch.float)
 
     # edge_attr
     edge_types = []
     for _, _, feat in G.edges(data=True):
         edge_types.append(int(feat.get("edge_type", 0)))  # 默认 BUFF=0
-    edge_attr = torch.tensor(edge_types, dtype=torch.long).view(-1, 1)
+    edge_attr = torch.tensor(edge_types, dtype=torch.float).view(-1, 1)
 
     # node_depth
-    node_depth = torch.tensor(compute_node_depth(G), dtype=torch.long)
+    node_depth = torch.tensor(compute_node_depth(G), dtype=torch.float)
 
     return Data(
         x=x,
@@ -74,7 +80,6 @@ if __name__ == "__main__":
     main()
 """
 python generate_pt.py \
-  --graphml openabcd/graphml/ac97_ctrl_orig.graphml \
-  --out openabcd/ac97_ctrl_orig.pt
-
+  --graphml datasets/openabcd/graphml/square_orig.bench.graphml \
+  --out datasets/openabcd/graph/square_orig.pt
 """

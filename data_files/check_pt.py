@@ -1,30 +1,3 @@
-
-# 指定PT文件所在目录
-# import torch
-# import os
-#
-# pt_dir = "openabcd/graph"
-# if not os.path.exists(pt_dir):
-#     os.makedirs(pt_dir)
-#
-# # 获取目录中所有的PT文件
-# pt_files = [f for f in os.listdir(pt_dir) if f.endswith('.pt')]
-#
-# # 遍历并加载每个PT文件
-# for pt_file in pt_files:
-#     # 构建完整文件路径
-#     file_path = os.path.join(pt_dir, pt_file)
-#
-#     # 加载模型
-#     model = torch.load(file_path, weights_only=False)
-#
-#     # 提取文件名（不含扩展名）作为模型名称
-#     model_name = os.path.splitext(pt_file)[0]
-#
-#     # 打印模型结构
-#     print(f"{model_name}: {model}")
-#     print("-" * 50)  # 分隔线，方便阅读
-
 """
 sageformer:
 aes_secworks_orig:Data(x=[74990, 3], edge_index=[2, 112681], edge_attr=[112681, 1])
@@ -64,7 +37,18 @@ def calculate_parameters(pt_file_path):
     try:
         # 加载PyG Data对象
         data = torch.load(pt_file_path, weights_only=False)
+        max_depth = data.node_depth.max().item()
+        depth_zero_ratio = (data.node_depth == 0).sum().item() / data.x.shape[0]
 
+        print(f"最大深度: {max_depth}")
+        print(f"深度为0的节点比例: {depth_zero_ratio:.2%}")
+
+        if max_depth == 0:
+            print("❌ 警告：所有节点深度为0，数据可能有问题！")
+        elif depth_zero_ratio > 0.1:  # 超过10%节点深度为0
+            print("⚠️  深度为0的节点过多，可能存在问题")
+        else:
+            print("✅ 深度分布正常")
         # 计算各项参数
         # Primary Inputs (PI)：节点类型为0的节点数量
         pi_count = int((data.x[:, 0] == 0).sum().item())
@@ -72,13 +56,13 @@ def calculate_parameters(pt_file_path):
         # Primary Outputs (PO)：节点类型为1的节点数量
         po_count = int((data.x[:, 0] == 1).sum().item())
 
-        # Nodes (N)：总节点数（x的行数）
-        total_nodes = data.x.shape[0]
+        # N
+        N_nodes = int((data.x[:, 0] == 2).sum().item())
 
         # Edges (E)：总边数（edge_index的列数）
         total_edges = data.edge_index.shape[1] if data.edge_index.numel() > 0 else 0
 
-        # Inverted edges (I)：反相边数量（edge_attr为1的边）
+        #Inverted edges (I)：反相边数量（edge_attr为1的边）
         inverted_edges = int((data.edge_attr == 1).sum().item()) if data.edge_attr.numel() > 0 else 0
 
         # Netlist Depth (D)：网表深度（最大节点深度）
@@ -88,9 +72,9 @@ def calculate_parameters(pt_file_path):
             'filename': os.path.basename(pt_file_path),
             'PI': pi_count,
             'PO': po_count,
-            'N': total_nodes,
+            'N': N_nodes,
+            'I':inverted_edges,
             'E': total_edges,
-            'I': inverted_edges,
             'D': netlist_depth,
             'status': 'success'
         }
@@ -111,7 +95,19 @@ def process_pt_directory(pt_dir, output_csv):
     """处理目录下所有.pt文件并将结果保存到CSV"""
     # 获取所有.pt文件
     pt_files = [f for f in os.listdir(pt_dir) if f.endswith('.pt')]
+    for pt_file in pt_files:
+        # 构建完整文件路径
+        file_path = os.path.join(pt_dir, pt_file)
 
+        # 加载模型
+        model = torch.load(file_path, weights_only=False)
+
+        # 提取文件名（不含扩展名）作为模型名称
+        model_name = os.path.splitext(pt_file)[0]
+
+        # 打印模型结构
+        print(f"{model_name}: {model}")
+        print("-" * 50)  # 分隔线，方便阅读
     if not pt_files:
         print(f"在目录 {pt_dir} 中未找到任何.pt文件")
         return
@@ -141,5 +137,5 @@ if __name__ == "__main__":
 
     process_pt_directory(args.pt_dir, args.output_csv)
 """
-python check_pt.py --pt openabcd/graph --output openabcd/pt_parameters.csv
+python data_files/check_pt.py --pt data_files/datasets/ISCAS85/graph --output data_files/datasets/ISCAS85/pt_parameters.csv
 """
