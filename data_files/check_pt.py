@@ -137,5 +137,5 @@ if __name__ == "__main__":
 
     process_pt_directory(args.pt_dir, args.output_csv)
 """
-python data_files/check_pt.py --pt data_files/datasets/ISCAS85/graph --output data_files/datasets/ISCAS85/pt_parameters.csv
+python data_files/check_pt.py --pt results/ISCAS85/AIGfake/ --output results/ISCAS85/pt_parameters.csv
 """

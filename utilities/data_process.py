@@ -15,7 +15,7 @@ def load_pt_dataset(dataset_dir, max_files=None):
     data_list = []
     for f in files:
         try:
-            d = torch.load(f)
+            d = torch.load(f,weights_only=False)
             if not isinstance(d, Data):
                 # Some projects save (Data, label) tuples
                 if isinstance(d, (tuple, list)) and isinstance(d[0], Data):

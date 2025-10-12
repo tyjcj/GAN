@@ -436,20 +436,15 @@ if __name__ == "__main__":
     print("Batch processing completed!")
 
 """
-# Usage examples:
-# Default (uses all CPU cores):
-python3 generate_csv_batch.py
 
-# Custom parallelization:
-python3 generate_csv_batch.py --max-processes 4 --max-threads 8
 
 # Original command with parallelization:
-python3 generate_csv_parallel.py \
+python data_files/generate_csv_delay.py \
   --abc /usr/local/bin/abc \
-  --rc /mnt/d/Users/14696/Desktop/postStudy/OpenABC-master/abc/abc.rc \
-  --bench-dir /mnt/d/Users/14696/Desktop/postStudy/OpenABC-master/bench_openabcd/bench_big  \
-  --scripts-dir /mnt/d/Users/14696/Desktop/postStudy/OpenABC-master/bench_openabcd/referenceScripts  \
-  --output-dir results_dft \
+  --rc data_files/abc/abc.rc \
+  --bench-dir data_files/datasets/ISCAS85/bench  \
+  --scripts-dir data_files/datasets/referenceScripts  \
+  --output-dir data_files/datasets/ISCAS85/delay_csv \
   --debug-dir debug_logs \
   --max-processes 1 \
   --max-threads 4
