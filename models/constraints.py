@@ -221,98 +221,87 @@ def aig_constraint_penalties(data: Data, weights: Optional[Dict[str, float]] = N
     """
     device = data.x.device
     num_nodes = data.x.size(0)
-    node_types = data.x[:, 0].long().cpu()
+    t = data.x[:, 0].long()  # on device
 
-    # Edge tensors (on CPU for simple Python ops; move back at the end)
-    ei = data.edge_index
-    ea = data.edge_attr
-    if ei is None:
-        ei = torch.zeros((2, 0), dtype=torch.long)
-    if ea is None:
-        ea = torch.zeros((0, 1), dtype=torch.long)
+    # edges
+    ei = data.edge_index if getattr(data, 'edge_index', None) is not None else torch.zeros((2,0), dtype=torch.long, device=device)
+    if ei.numel() == 0:
+        # trivial terms
+        zero = torch.tensor(0.0, device=device)
+        terms = {k: zero for k in ["pi_in","po_out","backedge","selfloop","dup_fanin","indeg_mse","fanin_type","reach_violation"]}
+        terms["total"] = zero
+        return terms
 
-    src = ei[0].tolist()
-    dst = ei[1].tolist()
+    src = ei[0]
+    dst = ei[1]
 
-    # Basic counts
-    t = node_types
-    pos = type_order_index(t)  # PI->AND->PO layering
+    pos = type_order_index(t).to(device)
 
-    pi_mask = (t == PI)
-    po_mask = (t == PO)
-    and_mask = (t == AND)
+    # self-loops
+    selfloop = (src == dst).sum().to(torch.float32)
 
-    # self-loop penalty
-    selfloop = sum(1 for u, v in zip(src, dst) if u == v)
-
-    # edges into PI & out of PO
-    pi_in = sum(1 for u, v in zip(src, dst) if int(t[v]) == PI)
-    po_out = sum(1 for u, v in zip(src, dst) if int(t[u]) == PO)
+    # edges into PI / out of PO
+    pi_in = (t[dst] == PI).sum().to(torch.float32)
+    po_out = (t[src] == PO).sum().to(torch.float32)
 
     # back-edges wrt PI->AND->PO layering
-    backedge = sum(1 for u, v in zip(src, dst) if not (int(pos[u]) < int(pos[v])))
+    backedge = (~(pos[src] < pos[dst])).sum().to(torch.float32)
 
-    # fanin-type violations (dst in {AND,PO} but src not in {PI,AND})
-    fanin_type = 0
-    for u, v in zip(src, dst):
-        if int(t[v]) in (AND, PO):
-            if int(t[u]) not in (PI, AND):
-                fanin_type += 1
+    # fanin-type violations
+    dst_t = t[dst]
+    src_t = t[src]
+    fanin_type = (((dst_t == AND) | (dst_t == PO)) & (~((src_t == PI) | (src_t == AND)))).sum().to(torch.float32)
 
-    # duplicate fanin penalty: (#in_edges - #unique_pred) accumulated over nodes
-    from collections import defaultdict, deque
-    preds = defaultdict(list)
-    for u, v in zip(src, dst):
-        preds[v].append(u)
-    dup_fanin = 0
-    for v, lst in preds.items():
-        dup_fanin += max(0, len(lst) - len(set(lst)))
+    # duplicate fanin per node: (#in_edges - #unique_pred)
+    # use scatter to count in-edges; unique per (dst, src) can be approximated by unique pairs
+    indeg = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    indeg = indeg.scatter_add(0, dst, torch.ones_like(dst))
+    # unique pairs count
+    pairs = src.to(torch.int64) * num_nodes + dst.to(torch.int64)
+    unique_pairs = torch.unique(pairs).numel()
+    dup_fanin = (dst.numel() - unique_pairs)
+    dup_fanin = torch.tensor(float(dup_fanin), device=device)
 
     # indegree target penalty
-    indeg = _indegree_tensor(num_nodes, ei)
-    target = torch.zeros(num_nodes, dtype=torch.long)
-    for i in range(num_nodes):
-        tt = int(t[i])
-        if tt == PI:
-            target[i] = 0
-        elif tt == PO:
-            target[i] = 1
-        elif tt == AND:
-            target[i] = 2
-        else:
-            target[i] = 0
+    target = torch.zeros(num_nodes, dtype=torch.long, device=device)
+    target = torch.where(t == PI, torch.zeros_like(target), target)
+    target = torch.where(t == PO, torch.ones_like(target), target)
+    target = torch.where(t == AND, torch.full_like(target, 2), target)
     indeg_mse = (indeg.to(torch.float32) - target.to(torch.float32)).abs().sum()
 
-    # reachability coverage: nodes on PI->PO paths
-    g_fwd = [[] for _ in range(num_nodes)]
-    for u, v in zip(src, dst):
+    # reachability coverage (approx): boolean BFS via adjacency lists on device is non-trivial; use CPU-light fallback with minimal transfer
+    # transfer compact edges to CPU ints for simple BFS, but only indices, not features
+    src_cpu = src.detach().cpu().tolist()
+    dst_cpu = dst.detach().cpu().tolist()
+    from collections import deque, defaultdict as _dd
+    g_fwd = _dd(list)
+    g_rev = _dd(list)
+    for u, v in zip(src_cpu, dst_cpu):
         g_fwd[u].append(v)
+        g_rev[v].append(u)
+    pis = [i for i in range(num_nodes) if int(t[i].item()) == PI]
+    pos_list = [i for i in range(num_nodes) if int(t[i].item()) == PO]
     seen_fwd = set()
-    dq = deque([i for i in range(num_nodes) if int(t[i]) == PI])
+    dq = deque(pis)
     while dq:
         u = dq.popleft()
         if u in seen_fwd:
             continue
         seen_fwd.add(u)
-        for v in g_fwd[u]:
+        for v in g_fwd.get(u, []):
             dq.append(v)
-    # reverse from POs
-    g_rev = [[] for _ in range(num_nodes)]
-    for u, v in zip(src, dst):
-        g_rev[v].append(u)
     seen_rev = set()
-    dq = deque([i for i in range(num_nodes) if int(t[i]) == PO])
+    dq = deque(pos_list)
     while dq:
         v = dq.popleft()
         if v in seen_rev:
             continue
         seen_rev.add(v)
-        for p in g_rev[v]:
+        for p in g_rev.get(v, []):
             dq.append(p)
-    on_path = seen_fwd & seen_rev
-    reach_violation = num_nodes - len(on_path)  # nodes unused by any PI->PO cone
+    on_path = len(seen_fwd & seen_rev)
+    reach_violation = torch.tensor(float(num_nodes - on_path), device=device)
 
-    # assemble losses
     w = {
         "pi_in": 1.0,
         "po_out": 1.0,
@@ -327,14 +316,14 @@ def aig_constraint_penalties(data: Data, weights: Optional[Dict[str, float]] = N
         w.update(weights)
 
     terms = {
-        "pi_in": torch.tensor(float(pi_in), device=device),
-        "po_out": torch.tensor(float(po_out), device=device),
-        "backedge": torch.tensor(float(backedge), device=device),
-        "selfloop": torch.tensor(float(selfloop), device=device),
-        "dup_fanin": torch.tensor(float(dup_fanin), device=device),
-        "indeg_mse": indeg_mse.to(device),
-        "fanin_type": torch.tensor(float(fanin_type), device=device),
-        "reach_violation": torch.tensor(float(reach_violation), device=device),
+        "pi_in": pi_in,
+        "po_out": po_out,
+        "backedge": backedge,
+        "selfloop": selfloop,
+        "dup_fanin": dup_fanin,
+        "indeg_mse": indeg_mse,
+        "fanin_type": fanin_type,
+        "reach_violation": reach_violation,
     }
     total = sum(w[k] * terms[k] for k in terms.keys())
     terms["total"] = total
@@ -497,6 +486,15 @@ def enforce_aig_constraints(data: Data, strict: bool = False, check_all_on_path:
         return data
 
     ei, ea = remove_self_and_dups(data.edge_index.cpu(), data.edge_attr.cpu())
+    # 过滤越界与负索引，确保所有端点位于 [0, num_nodes)
+    if ei is not None and ei.numel() > 0:
+        src_valid = (ei[0] >= 0) & (ei[0] < num_nodes)
+        dst_valid = (ei[1] >= 0) & (ei[1] < num_nodes)
+        valid_mask = src_valid & dst_valid
+        if valid_mask.sum().item() != ei.size(1):
+            ei = ei[:, valid_mask]
+            if ea is not None and ea.numel() > 0:
+                ea = ea[valid_mask]
     ei = ei.to(device)
     ea = ea.to(device)
 
@@ -509,50 +507,70 @@ def enforce_aig_constraints(data: Data, strict: bool = False, check_all_on_path:
     new_dst = []
     new_attr = []
 
-    # Enforce constraints
+    # Enforce constraints (no random padding; prefer legal reconnection or skip)
     for v in range(num_nodes):
         t = int(node_types[v].item())
         cur_preds = preds[v]
         if t == 0:
             continue  # PI: drop all incoming
         elif t == 1:
-            # PO: keep only one
-            if len(cur_preds) >= 1:
-                u, inv = cur_preds[0]
+            # PO: keep only one from legal predecessors; prefer AND, then deeper
+            legal = [(u, inv) for (u, inv) in cur_preds if int(node_types[u].item()) in (0, 2) and u != v]
+            if len(legal) >= 1:
+                # choose best by type priority AND>PI, then by node_depth if exists
+                nd = None
+                if hasattr(data, 'node_depth') and data.node_depth is not None and data.node_depth.numel() == num_nodes:
+                    nd = data.node_depth
+                def po_key(ui):
+                    u, inv = ui
+                    is_and = 1 if int(node_types[u].item()) == AND else 0
+                    depth = int(nd[u].item()) if nd is not None else 0
+                    return (-is_and, -depth, u)
+                u, inv = sorted(legal, key=po_key)[0]
                 new_src.append(u)
                 new_dst.append(v)
                 new_attr.append(inv)
-            else:
-                candidates = [i for i in range(num_nodes) if int(node_types[i].item()) in (0, 2) and i != v]
-                if candidates:
-                    u = random.choice(candidates)
-                    new_src.append(u)
-                    new_dst.append(v)
-                    new_attr.append(0)
+            # else: skip connecting this PO (remain without fanin)
         elif t == 2:
-            # AND: ensure 2 predecessors
-            if len(cur_preds) >= 2:
-                kept = cur_preds[:2]
-                for u, inv in kept:
-                    new_src.append(u)
-                    new_dst.append(v)
-                    new_attr.append(inv)
-            else:
-                kept = [u for u, inv in cur_preds]
-                candidates = [i for i in range(num_nodes) if int(node_types[i].item()) in (0, 2) and i != v]
-                random.shuffle(candidates)
-                for u in candidates:
-                    if u not in kept:
-                        kept.append(u)
-                    if len(kept) == 2:
+            # AND: ensure 2 predecessors from legal distinct sources; prefer PI/AND with smaller order and deeper depth
+            legal = [(u, inv) for (u, inv) in cur_preds if int(node_types[u].item()) in (0, 2) and u != v]
+            # add more candidates from graph if insufficient, but only legal and distinct
+            if len(legal) < 2:
+                present = set(u for u, _ in legal)
+                extra = []
+                for u in range(num_nodes):
+                    if u == v or u in present:
+                        continue
+                    tt = int(node_types[u].item())
+                    if tt in (0, 2):
+                        extra.append((u, 0))
+                legal.extend(extra)
+            if len(legal) >= 2:
+                nd = None
+                if hasattr(data, 'node_depth') and data.node_depth is not None and data.node_depth.numel() == num_nodes:
+                    nd = data.node_depth
+                # sort by: prefer PI/AND order (PI first to ensure DAG), then deeper depth, then id
+                pos = type_order_index(node_types)
+                def and_key(ui):
+                    u, inv = ui
+                    order = int(pos[u].item())
+                    depth = int(nd[u].item()) if nd is not None else 0
+                    return (order, -depth, u)
+                uniq = []
+                seen_u = set()
+                for u, inv in sorted(legal, key=and_key):
+                    if u in seen_u:
+                        continue
+                    uniq.append((u, inv))
+                    seen_u.add(u)
+                    if len(uniq) == 2:
                         break
-                # Pad if still <2
-                while len(kept) < 2:
-                    kept.append(0)  # Pad with 0 if less than 2
-                for u in kept[:2]:
-                    new_src.append(u)
-                    new_dst.append(v)
-                    new_attr.append(0)
+                if len(uniq) == 2:
+                    for u, inv in uniq:
+                        new_src.append(u)
+                        new_dst.append(v)
+                        new_attr.append(inv)
+                # else: skip this AND (do not force padding)
 
     # Handle edge case when no edges exist after processing
     if len(new_src) == 0:
@@ -593,14 +611,20 @@ def enforce_aig_constraints(data: Data, strict: bool = False, check_all_on_path:
     # Recompute inverted predecessor counts -> x[:, 1]
     inv_counts = torch.zeros(num_nodes, dtype=torch.long, device=device)
     if data.edge_index is not None and data.edge_index.numel() > 0:
-        dsts = data.edge_index[1].tolist()
+        # 只统计有效范围内的 dst，避免越界
+        dsts = data.edge_index[1].clamp(min=0, max=num_nodes-1).tolist()
         invs = data.edge_attr.view(-1).long().tolist()
         for d, inv in zip(dsts, invs):
             inv_counts[d] += int(inv)
 
-    # Ensure inv_counts matches the size of x[:, 1]
-    if inv_counts.size(0) != data.x.size(0):
-        inv_counts = torch.cat([inv_counts, torch.zeros(data.x.size(0) - inv_counts.size(0), dtype=torch.long, device=device)])
+    # 尺寸对齐（健壮分支，杜绝负维度）
+    target_n = int(data.x.size(0))
+    curr_n = int(inv_counts.size(0))
+    if curr_n < target_n:
+        pad_len = target_n - curr_n
+        inv_counts = torch.cat([inv_counts, torch.zeros(pad_len, dtype=torch.long, device=device)], dim=0)
+    elif curr_n > target_n:
+        inv_counts = inv_counts[:target_n]
 
     inv_counts = torch.clamp(inv_counts, max=2)
     data.x = data.x.clone()

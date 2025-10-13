@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from utilities.data_process import load_pt_dataset, pad_data, unpad_data, save_data_list_as_pt
 from models.generator import AIGGenerator
 from models.discriminator import AIGDiscriminator
-from models.constraints import enforce_aig_constraints, aig_constraint_penalties
+from models.constraints import enforce_aig_constraints, aig_constraint_penalties, validate_strict_aig
 
 
 
@@ -130,7 +130,7 @@ def valid_edge_mask(d: Data):
     return (d.edge_index.min(dim=0).values >= 0)
 
 
-def gradient_penalty(D, real_pad: Data, fake_pad: Data, device):
+def gradient_penalty(D, real_pad: Data, fake_pad: Data, device, use_edges: bool = True):
     """
     GP 只在“pad后”的 batch 上做插值，然后对 real/fake 的“共同有效边”做掩码，确保形状一致。
     返回：(gp_term, grad_norm_scalar)
@@ -138,7 +138,7 @@ def gradient_penalty(D, real_pad: Data, fake_pad: Data, device):
     # 共同有效边掩码（两侧都有效的边位）
     mask_real = valid_edge_mask(real_pad)
     mask_fake = valid_edge_mask(fake_pad)
-    if mask_real.numel() == 0 or mask_fake.numel() == 0:
+    if (mask_real.numel() == 0 or mask_fake.numel() == 0) or (not use_edges):
         # 没有边：只对节点特征做 GP
         alpha = torch.rand(1, 1, device=device)
         x_inter = (alpha * real_pad.x + (1 - alpha) * fake_pad.x).requires_grad_(True)
@@ -247,7 +247,7 @@ def train(args):
                     gap = D_real_mean - D_fake_mean
 
                     # 🔧 GP 一定要在“pad后”的 real/fake 上做（形状一致），并在函数内部对共同有效边做掩码
-                    gp_term, grad_norm = gradient_penalty(D, real_padded, fake_padded, device)
+                    gp_term, grad_norm = gradient_penalty(D, real_padded, fake_padded, device, use_edges=False)
 
                     # 标准 WGAN-GP：min_D (E[D(fake)] - E[D(real)] + λ*GP)
                     loss_D = (D_fake_mean - D_real_mean) + args.gp_lambda * gp_term
@@ -273,7 +273,16 @@ def train(args):
                 loss_G_adv = -torch.mean(D_on_raw)
 
                 # 结构惩罚
-                loss_pen = torch.stack([aig_constraint_penalties(r)["total"] for r in raw_gen]).mean()
+                pen_terms = [aig_constraint_penalties(r) for r in raw_gen]
+                loss_pen = torch.stack([pt["total"] for pt in pen_terms]).mean()
+                # 硬筛：严格不合规样本加大惩罚
+                hard_pen_scale = []
+                for r in raw_gen:
+                    violations = validate_strict_aig(r, check_all_on_path=True)
+                    scale = 10.0 if len(violations) > 0 else 1.0
+                    hard_pen_scale.append(torch.tensor(scale, dtype=torch.float32, device=device))
+                hard_pen_scale = torch.stack(hard_pen_scale).mean()
+                loss_pen = loss_pen * hard_pen_scale
                 loss_G = loss_G_adv + args.lambda_cons * loss_pen
                 loss_G.backward()
                 opt_G.step()
@@ -302,9 +311,27 @@ def train(args):
 
                 if global_step % args.save_every == 0:
                     raw_save = [r.cpu() for r in raw_gen[:min(len(raw_gen), args.save_num)]]
-                    corr_save = [enforce_aig_constraints(r).cpu() for r in raw_gen[:min(len(raw_gen), args.save_num)]]
+                    corr_list = [enforce_aig_constraints(r).cpu() for r in raw_gen[:min(len(raw_gen), args.save_num)]]
                     save_data_list_as_pt(raw_save, args.out_dir, prefix=f"raw_ep{epoch}_st{global_step}", start_idx=0)
-                    save_data_list_as_pt(corr_save, args.out_dir, prefix=f"corr_ep{epoch}_st{global_step}", start_idx=0)
+                    save_data_list_as_pt(corr_list, args.out_dir, prefix=f"corr_ep{epoch}_st{global_step}", start_idx=0)
+
+                    # 自动保存严格合规且 and>0、lev>0 的样本到 results/ISCAS85/pt_fake
+                    valid_dir = os.path.join("results", "ISCAS85", "pt_fake")
+                    os.makedirs(valid_dir, exist_ok=True)
+                    valid_to_save = []
+                    for i, c in enumerate(corr_list):
+                        violations = validate_strict_aig(c, check_all_on_path=True)
+                        # and>0、lev>0 检测：AND 计数与最大深度
+                        and_count = 0
+                        if hasattr(c, 'edge_index') and c.edge_index is not None and c.edge_index.numel() > 0:
+                            # 粗略估计 AND 数：节点类型统计
+                            if hasattr(c, 'x') and c.x is not None and c.x.size(1) > 0:
+                                and_count = int((c.x[:,0] == 2).sum().item())
+                        max_lev = int(c.node_depth.max().item()) if hasattr(c, 'node_depth') and c.node_depth is not None and c.node_depth.numel() > 0 else 0
+                        if len(violations) == 0 and and_count > 0 and max_lev > 0:
+                            valid_to_save.append(c)
+                    if len(valid_to_save) > 0:
+                        save_data_list_as_pt(valid_to_save, valid_dir, prefix=f"valid_ep{epoch}_st{global_step}", start_idx=0)
 
                 global_step += 1
 
@@ -338,9 +365,9 @@ if __name__ == "__main__":
     parser.add_argument("--candidate-k", type=int, default=512, help="Number of candidate predecessors per node.")
     parser.add_argument("--max-nodes", type=int, default=None, help="Maximum number of nodes per graph.")
     parser.add_argument("--max-edges", type=int, default=None, help="Maximum number of edges per graph.")
-    parser.add_argument("--lambda-cons", type=float, default=1e-3, help="Lambda for the structure penalty.")
+    parser.add_argument("--lambda-cons", type=float, default=1e-2, help="Lambda for the structure penalty.")
     parser.add_argument("--gp-lambda", type=float, default=10.0, help="Lambda for gradient penalty.")
-    parser.add_argument("--n-critic", type=int, default=5, help="Number of D updates per G update.")
+    parser.add_argument("--n-critic", type=int, default=3, help="Number of D updates per G update.")
     parser.add_argument("--save-every", type=int, default=10, help="Save samples every X steps.")
     parser.add_argument("--save-num", type=int, default=2, help="How many samples to save each checkpoint.")
     parser.add_argument("--log-every", type=int, default=1, help="Log every X steps.")
