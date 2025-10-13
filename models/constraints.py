@@ -164,6 +164,42 @@ def aig_allowed_edge_mask(node_types: Tensor, enforce_dag: bool = True) -> Tenso
     return M
 
 
+# ----------------------------
+# Generator-side helper masks (for DAG sampling)
+# ----------------------------
+def sampling_mask_topo(node_types: Tensor) -> Tensor:
+    """
+    Dense (N x N) boolean mask for generator sampling under strict topological order:
+      - Only allow {PI,AND} -> {AND,PO}
+      - No self-loops
+      - Strict PI->AND->PO order and forward-only edges using type_order_index
+    """
+    return aig_allowed_edge_mask(node_types, enforce_dag=True)
+
+
+def sampling_mask_layered(node_types: Tensor, layer_index: Tensor) -> Tensor:
+    """
+    Dense (N x N) mask allowing edges only from layer L to L+1 under AIG type rules.
+    layer_index[i] = layer id for node i (monotone increasing toward outputs).
+    """
+    n = node_types.size(0)
+    t = node_types.long()
+    src_ok = (t == PI) | (t == AND)
+    dst_ok = (t == AND) | (t == PO)
+    M = torch.zeros((n, n), dtype=torch.bool, device=node_types.device)
+    for u in range(n):
+        if not bool(src_ok[u]):
+            continue
+        for v in range(n):
+            if u == v:
+                continue
+            if not bool(dst_ok[v]):
+                continue
+            if int(layer_index[u].item()) + 1 == int(layer_index[v].item()):
+                M[u, v] = True
+    return M
+
+
 def apply_edge_mask_to_logits(edge_logits: Tensor, mask: Tensor, invalid_fill: float = -1e9) -> Tensor:
     """
     Apply boolean mask over dense edge logits A (N x N): invalid positions -> large negative.
@@ -485,18 +521,29 @@ def enforce_aig_constraints(data: Data, strict: bool = False, check_all_on_path:
         data.x[:, 1] = 0
         return data
 
-    ei, ea = remove_self_and_dups(data.edge_index.cpu(), data.edge_attr.cpu())
-    # 过滤越界与负索引，确保所有端点位于 [0, num_nodes)
-    if ei is not None and ei.numel() > 0:
+    # 清理与快速前向过滤（GPU端）
+    ei, ea = remove_self_and_dups(data.edge_index, data.edge_attr)
+    if ei is None:
+        ei = torch.zeros((2, 0), dtype=torch.long, device=device)
+    if ea is None:
+        ea = torch.zeros((0, 1), dtype=torch.long, device=device)
+    ei = ei.to(device)
+    ea = ea.to(device)
+    # 越界过滤
+    if ei.numel() > 0:
         src_valid = (ei[0] >= 0) & (ei[0] < num_nodes)
         dst_valid = (ei[1] >= 0) & (ei[1] < num_nodes)
         valid_mask = src_valid & dst_valid
-        if valid_mask.sum().item() != ei.size(1):
-            ei = ei[:, valid_mask]
-            if ea is not None and ea.numel() > 0:
-                ea = ea[valid_mask]
-    ei = ei.to(device)
-    ea = ea.to(device)
+        ei = ei[:, valid_mask]
+        if ea.numel() > 0:
+            ea = ea[valid_mask]
+    # 按拓扑顺序（类型顺序）移除后向边，避免 Kahn 循环修复的高开销
+    pos = type_order_index(node_types).to(device)
+    if ei.numel() > 0:
+        forward_mask = pos[ei[0]] < pos[ei[1]]
+        ei = ei[:, forward_mask]
+        if ea.numel() > 0:
+            ea = ea[forward_mask]
 
     # Collect predecessors
     preds = [[] for _ in range(num_nodes)]
@@ -580,40 +627,25 @@ def enforce_aig_constraints(data: Data, strict: bool = False, check_all_on_path:
         data.edge_index = torch.tensor([new_src, new_dst], dtype=torch.long, device=device)
         data.edge_attr = torch.tensor(new_attr, dtype=torch.long, device=device).unsqueeze(1)
 
-    # Fix cycles: Try Kahn, remove one incoming edge per node in cycle
-    is_dag, topo = topo_sort_kahn(num_nodes, data.edge_index.cpu())
-    attempts = 0
-    max_attempts = max(3, num_nodes // 2000)
-    while (not is_dag) and attempts < max_attempts:
-        present = set(topo)
-        all_nodes = set(range(num_nodes))
-        in_cycle = list(all_nodes - present)
-        if not in_cycle:
-            break
-        # For each node in cycle remove one incoming edge
-        mask = torch.ones(data.edge_index.size(1), dtype=torch.bool, device=device)
-        for idx in range(data.edge_index.size(1)):
-            u = int(data.edge_index[0, idx].item())
-            v = int(data.edge_index[1, idx].item())
-            if v in in_cycle:
-                mask[idx] = False
-                break
-        data.edge_index = data.edge_index[:, mask]
-        if data.edge_attr is not None:
-            data.edge_attr = data.edge_attr[mask]
-        is_dag, topo = topo_sort_kahn(num_nodes, data.edge_index.cpu())
-        attempts += 1
+    # 已通过 forward_mask 剪除后向边，通常不再需要 Kahn；如 strict 则保守再跑一次 Kahn 校验
+    if strict:
+        is_dag, _ = topo_sort_kahn(num_nodes, ei.cpu())
+        if not is_dag and ei.numel() > 0:
+            # 简单移除少量入边（选择 pos 不递增的边）
+            keep = pos[ei[0]] < pos[ei[1]]
+            ei = ei[:, keep]
+            if ea.numel() > 0:
+                ea = ea[keep]
 
     # Recompute node_depth
-    nd = compute_node_depths(num_nodes, data.edge_index.cpu(), node_types)
+    nd = compute_node_depths(num_nodes, ei.cpu(), node_types)
     data.node_depth = nd.to(device)
 
     # Recompute inverted predecessor counts -> x[:, 1]
     inv_counts = torch.zeros(num_nodes, dtype=torch.long, device=device)
-    if data.edge_index is not None and data.edge_index.numel() > 0:
-        # 只统计有效范围内的 dst，避免越界
-        dsts = data.edge_index[1].clamp(min=0, max=num_nodes-1).tolist()
-        invs = data.edge_attr.view(-1).long().tolist()
+    if ei is not None and ei.numel() > 0:
+        dsts = ei[1].clamp(min=0, max=num_nodes-1).tolist()
+        invs = ea.view(-1).long().tolist() if ea is not None and ea.numel() > 0 else [0]*len(dsts)
         for d, inv in zip(dsts, invs):
             inv_counts[d] += int(inv)
 
@@ -635,4 +667,32 @@ def enforce_aig_constraints(data: Data, strict: bool = False, check_all_on_path:
     data.x[:, 1] = inv_counts.to(dtype=data.x.dtype)
 
     return data
+
+
+# ----------------------------
+# Fast validity check (no Python BFS): type/direction/degree only
+# ----------------------------
+def fast_validity_checks(data: Data) -> bool:
+    """Quick checks: no self-loop; only forward type order; degrees PI=0-in, PO=1-in, AND=2-in."""
+    x = data.x
+    if x is None or x.size(1) == 0:
+        return False
+    t = x[:, 0].long()
+    n = x.size(0)
+    ei = data.edge_index
+    if ei is None or ei.numel() == 0:
+        return False
+    if (ei[0] == ei[1]).any():
+        return False
+    pos = type_order_index(t)
+    if (~(pos[ei[0]] < pos[ei[1]])).any():
+        return False
+    indeg = torch.zeros(n, dtype=torch.long, device=t.device).scatter_add(0, ei[1], torch.ones_like(ei[1]))
+    if (indeg[t == PO] != 1).any():
+        return False
+    if (indeg[t == AND] != 2).any():
+        return False
+    if (indeg[t == PI] != 0).any():
+        return False
+    return True
 

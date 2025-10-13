@@ -203,11 +203,21 @@ def train(args):
 
     print(f"[INFO] dataset size {len(data_list)}, max_nodes={max_nodes}, max_edges={max_edges}")
     padded_list = [pad_data(d, max_nodes=max_nodes, max_edges=max_edges) for d in data_list]
-    loader = PyGDataLoader(padded_list, batch_size=args.batch_size, shuffle=True, drop_last=False)
+    loader = PyGDataLoader(
+        padded_list,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=False,
+        num_workers=4,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=True if (os.cpu_count() or 0) > 1 else False,
+    )
 
     # 模型
     G = AIGGenerator(node_in_dim=2, hidden_dim=args.g_hidden, z_dim=args.z_dim, candidate_k=args.candidate_k).to(device)
     D = AIGDiscriminator(in_dim=2, hidden_dim=args.d_hidden).to(device)
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
 
     # 优化器
     opt_G = torch.optim.Adam(G.parameters(), lr=args.lr, betas=(0.5, 0.9))
@@ -227,13 +237,14 @@ def train(args):
 
                 # -------- 训练 D (n_critic 次) --------
                 D_real_val = D_fake_val = gap_val = gp_term_val = grad_norm_val = None
+                # 仅生成一次并复用于 n_critic 循环，显著减少 Python/CPU 开销
+                zs_once = [torch.randn(args.z_dim, device=device) for _ in templates]
+                raw_fakes_once = [G(t.to(device), z) for t, z in zip(templates, zs_once)]
+                corr_fakes_once = [enforce_aig_constraints(r) for r in raw_fakes_once]
+                corr_pads_once = [pad_data(c, max_nodes=max_nodes, max_edges=max_edges) for c in corr_fakes_once]
+                fake_padded_once = Batch.from_data_list(corr_pads_once).to(device)
                 for _ in range(args.n_critic):
-                    # 采样并“强制合规”后再给 D，便于判别器学习有意义差异
-                    zs = [torch.randn(args.z_dim, device=device) for _ in templates]
-                    raw_fakes = [G(t.to(device), z) for t, z in zip(templates, zs)]
-                    corr_fakes = [enforce_aig_constraints(r) for r in raw_fakes]  # 强制合规
-                    corr_pads = [pad_data(c, max_nodes=max_nodes, max_edges=max_edges) for c in corr_fakes]
-                    fake_padded = Batch.from_data_list(corr_pads).to(device)
+                    fake_padded = fake_padded_once
 
                     # 判别器前向用“裁边后”的干净图
                     real_for_D = sanitize_for_D(real_padded)
@@ -246,7 +257,7 @@ def train(args):
                     D_fake_mean = torch.mean(D_fake)
                     gap = D_real_mean - D_fake_mean
 
-                    # 🔧 GP 一定要在“pad后”的 real/fake 上做（形状一致），并在函数内部对共同有效边做掩码
+                    # 🔧 仅节点 GP 提速
                     gp_term, grad_norm = gradient_penalty(D, real_padded, fake_padded, device, use_edges=False)
 
                     # 标准 WGAN-GP：min_D (E[D(fake)] - E[D(real)] + λ*GP)
@@ -272,17 +283,17 @@ def train(args):
                 D_on_raw = D(raw_batch_for_D)
                 loss_G_adv = -torch.mean(D_on_raw)
 
-                # 结构惩罚
+                # 结构惩罚（GPU化）；严格校验降频到保存步
                 pen_terms = [aig_constraint_penalties(r) for r in raw_gen]
                 loss_pen = torch.stack([pt["total"] for pt in pen_terms]).mean()
-                # 硬筛：严格不合规样本加大惩罚
-                hard_pen_scale = []
-                for r in raw_gen:
-                    violations = validate_strict_aig(r, check_all_on_path=True)
-                    scale = 10.0 if len(violations) > 0 else 1.0
-                    hard_pen_scale.append(torch.tensor(scale, dtype=torch.float32, device=device))
-                hard_pen_scale = torch.stack(hard_pen_scale).mean()
-                loss_pen = loss_pen * hard_pen_scale
+                if (global_step % args.save_every) == 0:
+                    hard_pen_scale = []
+                    for r in raw_gen:
+                        violations = validate_strict_aig(r, check_all_on_path=True)
+                        scale = 10.0 if len(violations) > 0 else 1.0
+                        hard_pen_scale.append(torch.tensor(scale, dtype=torch.float32, device=device))
+                    hard_pen_scale = torch.stack(hard_pen_scale).mean()
+                    loss_pen = loss_pen * hard_pen_scale
                 loss_G = loss_G_adv + args.lambda_cons * loss_pen
                 loss_G.backward()
                 opt_G.step()
