@@ -256,12 +256,14 @@ def pt_to_bench(pt_path, out_path, verbose=True):
 
     # inputs
     node_names = {}
+    defined_signals = set()
     input_counter = 1
     for i in range(num_nodes):
         if node_types[i] == PI:
             name = f"N{input_counter}"
             node_names[i] = name
             lines.append(f"INPUT({name})")
+            defined_signals.add(name)
             input_counter += 1
         else:
             node_names[i] = f"n{i}"
@@ -269,6 +271,7 @@ def pt_to_bench(pt_path, out_path, verbose=True):
     # AND/internal
     not_defs = set()
     body_lines = []
+    and_defined = set()
     for i in range(num_nodes):
         if node_types[i] != AND or i not in on_path:
             continue
@@ -277,7 +280,7 @@ def pt_to_bench(pt_path, out_path, verbose=True):
             preds = sorted(preds, key=lambda t: (float(node_depth[t[0]]), t[0]))
         else:
             preds = sorted(preds, key=lambda t: t[0])
-        if len(preds) < 2:
+        if len(preds) == 0:
             continue
         in_exprs = []
         for src, inv in preds:
@@ -287,8 +290,13 @@ def pt_to_bench(pt_path, out_path, verbose=True):
                 if inv_name not in not_defs:
                     body_lines.append(f"{inv_name} = NOT({base})")
                     not_defs.add(inv_name)
+                    defined_signals.add(inv_name)
                 base = inv_name
             in_exprs.append(base)
+        # Ensure at least two fanins for structural AIG.
+        if len(in_exprs) == 1:
+            # Duplicate the single fanin to synthesise a degenerate AND (acts as buffer).
+            in_exprs.append(in_exprs[0])
         # Build only AND logic (AIG 2-input). If >2 inputs, fold to tree.
         if len(in_exprs) == 2:
             body_lines.append(f"{node_names[i]} = AND({in_exprs[0]}, {in_exprs[1]})")
@@ -297,14 +305,32 @@ def pt_to_bench(pt_path, out_path, verbose=True):
             for k, term in enumerate(in_exprs[1:-1], start=1):
                 tmp = f"{node_names[i]}_and{k}"
                 body_lines.append(f"{tmp} = AND({acc}, {term})")
+                defined_signals.add(tmp)
                 acc = tmp
             body_lines.append(f"{node_names[i]} = AND({acc}, {in_exprs[-1]})")
+        defined_signals.add(node_names[i])
+        and_defined.add(i)
 
     # outputs
     output_counter = 1
     added_outputs = set()
     outputs_emitted = 0
     outputs_to_and = 0
+    def resolve_output_signal(cand_s, cand_inv):
+        """Return a defined signal name to drive output or None."""
+        base = node_names[cand_s]
+        if node_types[cand_s] == AND and cand_s not in and_defined:
+            return None
+        if node_types[cand_s] == PI and base not in defined_signals:
+            defined_signals.add(base)
+        signal = base
+        if cand_inv:
+            inv_name = f"{base}_not_out{output_counter}"
+            body_lines.append(f"{inv_name} = NOT({base})")
+            defined_signals.add(inv_name)
+            signal = inv_name
+        return signal
+
     for i in range(num_nodes):
         if node_types[i] != PO or i not in on_path:
             continue
@@ -317,21 +343,26 @@ def pt_to_bench(pt_path, out_path, verbose=True):
             is_and = 1 if node_types[s] == AND else 0
             d = float(node_depth[s]) if node_depth is not None else 0.0
             return (-is_and, d, s)
-        # only consider AND predecessors to ensure logic depth
         preds_sorted = sorted(preds, key=sort_key)
-        src, inv = None, 0
+        base = None
         for cand_s, cand_inv in preds_sorted:
-            if node_types[cand_s] == AND:
-                src, inv = cand_s, cand_inv
+            # Prefer AND nodes with definitions, fall back to defined PIs.
+            if node_types[cand_s] == AND and cand_s not in and_defined:
+                continue
+            candidate = resolve_output_signal(cand_s, cand_inv)
+            if candidate is not None:
+                base = candidate
                 break
-        if src is None:
+        if base is None:
+            # As a last resort, try any predecessor regardless of type.
+            for cand_s, cand_inv in preds_sorted:
+                candidate = resolve_output_signal(cand_s, cand_inv)
+                if candidate is not None:
+                    base = candidate
+                    break
+        if base is None:
             continue
-        base = node_names[src]
-        # 直接将 AND/PI 名称作为输出，若需要反相则先插入 NOT，再将 NOT 名称作为输出名；避免 BUFF 以免被优化掉
-        if inv:
-            inv_name = f"{base}_not_out{output_counter}"
-            body_lines.append(f"{inv_name} = NOT({base})")
-            base = inv_name
+        driver_signal = base
         # 如果 base 已在输出集合中，追加去重后缀
         if base in added_outputs:
             base = f"{base}_dup{output_counter}"
@@ -339,14 +370,15 @@ def pt_to_bench(pt_path, out_path, verbose=True):
         added_outputs.add(base)
         output_counter += 1
         outputs_emitted += 1
-        outputs_to_and += 1
+        if driver_signal in defined_signals:
+            outputs_to_and += 1
 
     # Fallback: if no outputs emitted but there are ANDs on-path, synthesize outputs from deepest ANDs
     if outputs_to_and == 0:
-        and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in on_path]
+        and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in on_path and i in and_defined]
         if len(and_nodes_on_path) == 0:
             # as last resort, pick any AND reachable from PI
-            and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in reachable]
+            and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in reachable and i in and_defined]
         if len(and_nodes_on_path) > 0:
             # pick up to 2 deepest ANDs
             if node_depth is not None:
@@ -354,9 +386,11 @@ def pt_to_bench(pt_path, out_path, verbose=True):
             else:
                 and_nodes_on_path.sort(reverse=True)
             for pick in and_nodes_on_path[:2]:
-                # 直接输出 AND 名称
-                lines.append(f"OUTPUT({node_names[pick]})")
-                output_counter += 1
+                name = node_names[pick]
+                if name not in added_outputs:
+                    lines.append(f"OUTPUT({name})")
+                    added_outputs.add(name)
+                    output_counter += 1
 
     lines.extend(body_lines)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
