@@ -246,6 +246,17 @@ def pt_to_bench(pt_path, out_path, verbose=True):
     reachable = _reachable_from_inputs(edge_index, node_types)
     rev_reach = _reverse_reachable_to_pos(edge_index, node_types)
     on_path = reachable & rev_reach
+    # If there is no clean PI->PO path (common for noisy samples), fall back to a
+    # maximally connected region so that we can still emit a structurally valid
+    # circuit instead of returning an empty netlist.
+    if on_path:
+        active_region = set(on_path)
+    elif reachable:
+        active_region = set(reachable)
+    elif rev_reach:
+        active_region = set(rev_reach)
+    else:
+        active_region = set(i for i in range(num_nodes) if node_types[i] in (PI, AND, PO))
     num_reach_and = sum(1 for i in range(num_nodes) if node_types[i] == AND and i in on_path)
     num_reach_po = sum(1 for i in range(num_nodes) if node_types[i] == PO and i in on_path)
     if verbose:
@@ -273,9 +284,9 @@ def pt_to_bench(pt_path, out_path, verbose=True):
     body_lines = []
     and_defined = set()
     for i in range(num_nodes):
-        if node_types[i] != AND or i not in on_path:
+        if node_types[i] != AND or i not in active_region:
             continue
-        preds = [(s, inv) for (s, inv) in edge_map.get(i, []) if s in on_path and node_types[s] in (PI, AND)]
+        preds = [(s, inv) for (s, inv) in edge_map.get(i, []) if s in active_region and node_types[s] in (PI, AND)]
         if node_depth is not None:
             preds = sorted(preds, key=lambda t: (float(node_depth[t[0]]), t[0]))
         else:
@@ -315,7 +326,6 @@ def pt_to_bench(pt_path, out_path, verbose=True):
     output_counter = 1
     added_outputs = set()
     outputs_emitted = 0
-    outputs_to_and = 0
     def resolve_output_signal(cand_s, cand_inv):
         """Return a defined signal name to drive output or None."""
         base = node_names[cand_s]
@@ -331,10 +341,22 @@ def pt_to_bench(pt_path, out_path, verbose=True):
             signal = inv_name
         return signal
 
+    # Candidate POs: prefer those on a valid path; if none exist, accept any PO
+    # that has at least one predecessor to keep the output list non-empty.
+    po_candidates = []
     for i in range(num_nodes):
-        if node_types[i] != PO or i not in on_path:
+        if node_types[i] != PO:
             continue
+        if i in on_path or (not on_path and (i in active_region or edge_map.get(i))):
+            po_candidates.append(i)
+
+    for i in po_candidates:
         preds = [(s, inv) for (s, inv) in edge_map.get(i, []) if s in on_path]
+        if len(preds) == 0:
+            # Try relaxed predecessors if strict on_path yielded nothing.
+            preds = [(s, inv) for (s, inv) in edge_map.get(i, []) if s in active_region]
+        if len(preds) == 0:
+            preds = edge_map.get(i, [])
         if len(preds) == 0:
             continue
         # Prefer AND-driven predecessor, then by depth
@@ -370,15 +392,13 @@ def pt_to_bench(pt_path, out_path, verbose=True):
         added_outputs.add(base)
         output_counter += 1
         outputs_emitted += 1
-        if driver_signal in defined_signals:
-            outputs_to_and += 1
 
     # Fallback: if no outputs emitted but there are ANDs on-path, synthesize outputs from deepest ANDs
-    if outputs_to_and == 0:
-        and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in on_path and i in and_defined]
+    if outputs_emitted == 0:
+        and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in active_region and i in and_defined]
         if len(and_nodes_on_path) == 0:
-            # as last resort, pick any AND reachable from PI
-            and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in reachable and i in and_defined]
+            # as last resort, pick any AND that we defined
+            and_nodes_on_path = [i for i in range(num_nodes) if node_types[i] == AND and i in and_defined]
         if len(and_nodes_on_path) > 0:
             # pick up to 2 deepest ANDs
             if node_depth is not None:
@@ -386,6 +406,16 @@ def pt_to_bench(pt_path, out_path, verbose=True):
             else:
                 and_nodes_on_path.sort(reverse=True)
             for pick in and_nodes_on_path[:2]:
+                name = node_names[pick]
+                if name not in added_outputs:
+                    lines.append(f"OUTPUT({name})")
+                    added_outputs.add(name)
+                    output_counter += 1
+        elif reachable:
+            # If we still have nothing, expose a couple of primary inputs so the
+            # bench remains syntactically valid even for trivial graphs.
+            pi_fallback = [i for i in range(num_nodes) if node_types[i] == PI]
+            for pick in pi_fallback[: max(1, min(2, len(pi_fallback)) )]:
                 name = node_names[pick]
                 if name not in added_outputs:
                     lines.append(f"OUTPUT({name})")
